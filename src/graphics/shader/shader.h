@@ -130,6 +130,9 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
+	// Per-draw uniform control flow is part of the compiled vertex fetch layout.
+	std::vector<std::pair<uint32_t, bool>> fetch_branches;
+	std::vector<std::pair<uint64_t, uint64_t>> fetch_reads;
 	ShaderType                  logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;

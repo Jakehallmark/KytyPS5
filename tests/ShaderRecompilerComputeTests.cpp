@@ -46,6 +46,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderFetchControl.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -15912,7 +15913,8 @@ public:
 
   void CheckRasterization(
       bool depth_feedback,
-      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
+      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float,
+      bool unused_vertex_descriptor = false) {
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
@@ -16051,7 +16053,12 @@ public:
     ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
     vertex.stage.program = &vertex_program;
     vertex.stage.resources = &vertex_snapshot;
-    vertex.resources_num = 2;
+    vertex.resources_num = unused_vertex_descriptor ? 3 : 2;
+    if (unused_vertex_descriptor) {
+      // Constant-only fetches have no SPIR-V input.
+      vertex.resources[2].fields[1] = 0x0004dfacu;
+      vertex.resources_dst[2].registers_num = 3;
+    }
     vertex.buffers_num = 1;
     vertex.buffers[0].stride = 6 * sizeof(float);
     vertex.resources[1].UpdateAddress48(2 * sizeof(float));
@@ -38381,7 +38388,10 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto Compile = [&](const char *name, const std::vector<u32> &code,
                            u32 slot10, ShaderType stage = ShaderType::Vertex,
-                           Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
+                           Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float,
+                           u32 expected_components = 4,
+                           u32 selectors = DstSel(4, 5, 6, 7),
+                           const ShaderBufferResource *resource = nullptr) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
     ShaderVertexInputInfo vertex;
@@ -38394,7 +38404,10 @@ void CheckEmbeddedFetchVertexOffset() {
     vertex.fetch_attrib_reg = 2;
     vertex.resources_num = 1;
     vertex.resources[0].fields[3] =
-        BufferFormat(format) << 12u | DstSel(4, 5, 6, 7);
+        BufferFormat(format) << 12u | selectors;
+    if (resource != nullptr) {
+      vertex.resources[0] = *resource;
+    }
     vertex.resources_dst[0].attr_id = 0;
     vertex.resources_dst[0].registers_num = 4;
 
@@ -38420,7 +38433,7 @@ void CheckEmbeddedFetchVertexOffset() {
     auto result = ShaderRecompiler::CompileProgram(
         std::move(translated), options, specialization);
     Require(name, "fetch rewrite",
-            result.program.info.vertex_fetch_components[0] == 4,
+            result.program.info.vertex_fetch_components[0] == expected_components,
             "encoded fetch sequence was not recognized and rewritten");
     return CompiledShader{std::move(result.spirv), std::move(result.program),
                           std::move(resources), {}};
@@ -38471,6 +38484,30 @@ void CheckEmbeddedFetchVertexOffset() {
               "unsigned LS attributes must preserve their native integer bits");
     }
   }
+
+  for (const auto [raw_format, expected_components] :
+       {std::pair<u32, u32>{113, 4}, {121, 2}}) {
+    const auto fetched = Compile(
+        "EmbeddedFetchCompatibilityFormat", MakeFetch({}, {}, 0, false, true), 7,
+        ShaderType::Local, static_cast<Prospero::BufferFormat>(raw_format),
+        expected_components);
+    ValidateSpirv("EmbeddedFetchCompatibilityFormat", fetched.spirv);
+    Require("EmbeddedFetchCompatibilityFormat", "native input width",
+            std::ranges::any_of(fetched.program.info.inputs, [&](const auto &input) {
+              return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
+                     input.location == 0 && input.component_count == expected_components;
+            }), "compatibility vertex format must match the renderer input width");
+  }
+
+  const auto constant = Compile(
+      "ConstantOnlyEmbeddedFetch", MakeFetch({}, {}, 0, false, true), 0,
+      ShaderType::Local, static_cast<Prospero::BufferFormat>(0), 0,
+      DstSel(0, 1, 0, 1));
+  ValidateSpirv("ConstantOnlyEmbeddedFetch", constant.spirv);
+  Require("ConstantOnlyEmbeddedFetch", "no native attribute",
+          std::ranges::none_of(constant.program.info.inputs, [](const auto &input) {
+            return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter;
+          }), "constant selectors must not declare a vertex memory input");
 
   const auto valid =
       Compile("EmbeddedFetchVertexOffset", MakeFetch({{18, 0}}), 7);
@@ -43149,6 +43186,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+#include "ShaderFetchControlTests.h"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -43898,6 +43937,10 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--conditional-vertex-fetch-only") == 0) {
+    CheckShaderFetchControl();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
     return 0;
@@ -43906,6 +43949,12 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--constant-vertex-input-only") == 0) {
+    CheckEmbeddedFetchVertexOffset();
+    VulkanHarness vulkan;
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k32_32_32_32Float, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
@@ -44150,6 +44199,7 @@ int main(int argc, char **argv) {
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+  CheckShaderFetchControl();
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
@@ -44187,6 +44237,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckBgra16Readback();
     vulkan.CheckRasterization(false);
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k32_32_32_32Float, true);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();

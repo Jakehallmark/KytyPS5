@@ -15,16 +15,21 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "graphics/shader/shaderFetchControl.h"
 #include "libs/errno.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -339,6 +344,7 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        std::span<const ShaderSemantic> input_semantics,
+                                       std::span<const int> active_attributes,
                                        const uint32_t* attrib, const uint32_t* buffer) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -348,26 +354,40 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const auto& in = input_semantics[i];
+		if (std::find(active_attributes.begin(), active_attributes.end(),
+		              static_cast<int>(in.semantic)) == active_attributes.end()) {
+			continue;
+		}
 
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
+
+		// Vertex tables can be produced by earlier compute work. Read their current
+		// GPU-backed contents before interpreting buffer indices or descriptor fields.
+		uint32_t attrib_word = 0;
+		EXIT_IF(!Libs::LibKernel::Memory::TryReadBufferBacking(
+		    reinterpret_cast<uint64_t>(attrib) + uint64_t{in.semantic} * sizeof(uint32_t),
+		    &attrib_word, sizeof(attrib_word)));
 
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
 		if (debug_dump) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			     attrib_word);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
+		size_t index = attrib_word & 0x1fu;
 		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		    static_cast<Prospero::VertexAttribFormat>((attrib_word >> 5u) & 0x1ffu);
+		uint32_t offset      = (attrib_word >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attrib_word >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		std::array<uint32_t, 4> sharp {};
+		EXIT_IF(!Libs::LibKernel::Memory::TryReadBufferBacking(
+		    reinterpret_cast<uint64_t>(buffer) + index * sizeof(sharp), sharp.data(),
+		    sizeof(sharp)));
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
@@ -381,8 +401,6 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[1]       = sharp[1];
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
-		EXIT_NOT_IMPLEMENTED(r.AddTid());
-		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
@@ -394,6 +412,18 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
 			                     channels > 3u ? 7u : 1u);
 		}
+
+		if (r.AddTid() || r.SwizzleEnabled()) {
+			EXIT("Unsupported vertex buffer descriptor: semantic=%u attribute=%08x "
+			     "buffer_index=%zu offset=%u attrib_table=0x%016" PRIx64
+			     " buffer_table=0x%016" PRIx64
+			     " descriptor=%08x,%08x,%08x,%08x add_tid=%u swizzle=%u\n",
+			     in.semantic, attrib_word, index, offset,
+			     reinterpret_cast<uint64_t>(attrib), reinterpret_cast<uint64_t>(buffer),
+			     sharp[0], sharp[1], sharp[2], sharp[3],
+			     static_cast<unsigned>(r.AddTid()), static_cast<unsigned>(r.SwizzleEnabled()));
+		}
+
 		if (offset != 0) {
 			r.UpdateAddress48(r.Base48() + offset);
 		}
@@ -458,13 +488,17 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
-static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
+static bool ShaderGetStaticVertexInputInfo(const ShaderParams& params, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data,
-                                           ShaderVertexInputInfo&  info) {
+                                           ShaderVertexInputInfo&  info, uint32_t wave_size = 64,
+                                           ShaderType logical_stage = ShaderType::Vertex) {
 	KYTY_PROFILER_FUNCTION();
 
 	info = {};
+	info.wave_size = wave_size;
+	info.logical_stage = logical_stage;
+	const auto shader_addr = params.Base();
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -497,12 +531,96 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
 
-		if (attrib == nullptr || buffer == nullptr) {
-			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
-			     shader_addr);
-			return false;
+		// Resolve only uniform branch dependencies before touching vertex tables.
+		// A draw may provide fewer descriptors than the shader declares when the
+		// remaining fetches belong to an inactive branch.
+		ShaderRecompiler::CompileOptions options;
+		options.stage = logical_stage;
+		options.wave_size = wave_size;
+		options.user_data_base = 8;
+		options.user_data = std::span(user_sgpr.value, user_sgpr_num);
+		options.input_info.vertex = &info;
+		// Keep decoded code and reachable fetch plans; only the branch dependencies
+		// are re-read for each draw. Own the code because guest shader addresses can
+		// be recycled while an identical shader hash remains in this cache.
+		using Decisions = std::vector<std::pair<uint32_t, bool>>;
+		using SourceKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t,
+		                             int32_t, int32_t, size_t>;
+		struct SourceEntry {
+			ShaderRecompiler::ShaderSource source;
+			std::map<Decisions, std::vector<int>> attributes;
+			uint64_t last_use = 0;
+		};
+		static thread_local std::map<SourceKey, SourceEntry> sources;
+		static thread_local uint64_t source_clock = 0;
+		constexpr size_t MaxSources = 256;
+		constexpr size_t MaxBranchPlans = 64;
+		const SourceKey source_key {params.hash, static_cast<uint32_t>(logical_stage),
+		                            wave_size, user_sgpr_num, info.fetch_attrib_reg,
+		                            info.fetch_buffer_reg, params.code.size()};
+		auto cached = sources.find(source_key);
+		if (cached == sources.end()) {
+			std::vector<uint32_t> code(params.code.size());
+			if (!Libs::LibKernel::Memory::TryReadBacking(shader_addr, code.data(), params.code.size_bytes())) {
+				return false;
+			}
+			if (sources.size() >= MaxSources) {
+				const auto oldest = std::min_element(sources.begin(), sources.end(),
+				    [](const auto& a, const auto& b) { return a.second.last_use < b.second.last_use; });
+				sources.erase(oldest);
+			}
+			cached = sources.try_emplace(source_key).first;
+			auto& retained = cached->second.source;
+			retained = ShaderRecompiler::PrepareShaderSource(code, options);
+			if (retained.code.empty()) {
+				const auto decoded_words = retained.decoded.code.size();
+				retained.code = std::move(code);
+				retained.decoded.code = std::span<const uint32_t>(retained.code).first(decoded_words);
+			}
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
+		cached->second.last_use = ++source_clock;
+		auto& source = cached->second.source;
+		// Separate fetch functions are handled by the existing call linker.
+		std::vector<int> active_attributes;
+		if (source.call) {
+			for (const auto& semantic: metadata.input_semantics) {
+				active_attributes.push_back(static_cast<int>(semantic.semantic));
+			}
+		} else {
+			const auto control = ShaderRecompiler::AnalyzeShaderFetchControl(
+			    source.decoded, options.user_data, options.user_data_base,
+			    [](void*, uint64_t address, std::span<uint32_t> words) {
+				    return Libs::LibKernel::Memory::TryReadBufferBacking(
+				        address, words.data(), words.size_bytes());
+			    }, nullptr, wave_size);
+			info.fetch_branches = control.decisions;
+			info.fetch_reads = control.reads;
+			auto& plans = cached->second.attributes;
+			auto plan = plans.find(control.decisions);
+			if (plan == plans.end()) {
+				const auto specialized = ShaderRecompiler::ApplyShaderFetchControl(source.decoded, control);
+				auto attributes = ShaderRecompiler::GetEmbeddedVertexFetchAttributes(
+				    specialized, info, options.user_data_base, user_sgpr_num);
+				if (plans.size() >= MaxBranchPlans) plans.clear();
+				plan = plans.emplace(control.decisions, std::move(attributes)).first;
+				if (Config::GraphicsDebugDumpEnabled()) {
+					for (const auto& [pc, taken]: control.decisions) {
+						LOGF("Shader fetch branch: hash=0x%016" PRIx64 " pc=0x%08" PRIx32
+						     " taken=%u active_attributes=%zu\n", params.hash, pc,
+						     static_cast<uint32_t>(taken), plan->second.size());
+					}
+				}
+			}
+			active_attributes = plan->second;
+		}
+		if (!active_attributes.empty()) {
+			if (attrib == nullptr || buffer == nullptr) {
+				LOGF("ShaderGetVertexInputInfo(): null active vertex table pointer shader=0x%016" PRIx64 "\n",
+				     shader_addr);
+				return false;
+			}
+			ShaderApplyAttribSemantics(info, metadata.input_semantics, active_attributes, attrib, buffer);
+		}
 		ShaderDetectBuffers(info);
 	}
 	return true;
@@ -606,6 +724,11 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
+	key.push_back(static_cast<uint32_t>(info.fetch_branches.size()));
+	for (const auto& [pc, taken]: info.fetch_branches) {
+		key.push_back(pc);
+		key.push_back(static_cast<uint32_t>(taken));
+	}
 	key.push_back(info.wave_size);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
@@ -717,8 +840,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged || native_ngg ? 8u : 0u);
 	if (!merged && !native_ngg) {
-		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
-		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
+		if (!ShaderGetStaticVertexInputInfo(params, regs.gs_user_sgpr,
+		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info,
+		                                    (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
@@ -820,8 +944,9 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
 	input_info = {};
-	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+	if (!ShaderGetStaticVertexInputInfo(params[0], regs.hs_user_sgpr,
+	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0],
+	                                    64u, ShaderType::Local)) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;

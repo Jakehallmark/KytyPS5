@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/shaderFetchControl.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -208,6 +209,21 @@ int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
 }
 
+// The metadata lists declared semantics, including fetches in inactive paths.
+Decoder::Program ReachableFetchInstructions(const Decoder::Program& decoded,
+                                           const CFG::Graph& cfg) {
+	auto reachable = decoded;
+	reachable.instructions.clear();
+	std::vector<bool> live(decoded.instructions.size());
+	for (const auto& block: cfg.blocks) {
+		for (uint32_t i = block.inst_begin; i < block.inst_end; ++i) live[i] = true;
+	}
+	for (size_t i = 0; i < decoded.instructions.size(); ++i) {
+		if (live[i]) reachable.instructions.push_back(decoded.instructions[i]);
+	}
+	return reachable;
+}
+
 Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
     const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
     uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
@@ -220,7 +236,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 	bool    vertex_offset_conflict    = false;
 	bool    instance_offset_conflict  = false;
 
-	const int shift_regs = 8;
+	const int shift_regs = static_cast<int>(user_data_base);
 	const int attrib_reg = input_info->fetch_attrib_reg + shift_regs;
 	const int buffer_reg = input_info->fetch_buffer_reg + shift_regs;
 
@@ -581,6 +597,20 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 
 } // namespace
 
+std::vector<int> GetEmbeddedVertexFetchAttributes(
+    const Decoder::Program& decoded, const ShaderVertexInputInfo& info,
+    uint32_t user_data_base, uint32_t user_data_count) {
+	const auto cfg = CFG::BuildGraph(decoded);
+	const auto reachable = ReachableFetchInstructions(decoded, cfg);
+	const auto plan = DetectEmbeddedVertexFetch(reachable, &info, user_data_base,
+	                                          user_data_count, info.wave_size);
+	std::vector<int> attributes;
+	for (const auto& load: plan.loads) attributes.push_back(load.attrib_id);
+	std::sort(attributes.begin(), attributes.end());
+	attributes.erase(std::unique(attributes.begin(), attributes.end()), attributes.end());
+	return attributes;
+}
+
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
@@ -695,7 +725,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return TranslateProgram(source.decoded, options);
 }
 
-TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
+TranslateResult TranslateProgram(const Decoder::Program& source_decoded, const CompileOptions& options) {
+	Decoder::Program specialized;
+	const auto* decoded_ptr = &source_decoded;
+	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
+	    options.input_info.vertex != nullptr && !options.input_info.vertex->fetch_branches.empty()) {
+		ShaderFetchControl control;
+		control.decisions = options.input_info.vertex->fetch_branches;
+		specialized = ApplyShaderFetchControl(source_decoded, control);
+		decoded_ptr = &specialized;
+	}
+	const auto& decoded = *decoded_ptr;
 	EXIT_IF(decoded.instructions.empty());
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
@@ -764,8 +804,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
+		const auto reachable = ReachableFetchInstructions(decoded, native_cfg);
 		embedded_fetch = DetectEmbeddedVertexFetch(
-		    decoded, options.input_info.vertex, options.user_data_base,
+		    reachable, options.input_info.vertex, options.user_data_base,
 		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
 			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
