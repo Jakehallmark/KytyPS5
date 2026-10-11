@@ -26,11 +26,6 @@
 
 namespace Libs::Graphics {
 
-// IDK: maybe we can remove it?
-constexpr uint8_t kTemporaryVertexAttribFormat113 =
-    static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
-constexpr uint32_t kTemporaryPs5BufferFormat121 = 121u;
-
 static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_components) {
 	if (used_components == 0 || used_components >= size) {
 		return false;
@@ -93,36 +88,10 @@ static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_
 
 static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
                            uint32_t used_components) {
-	const auto fmt        = res.Format();
 	const auto raw_format = res.RawFormat();
-	if (raw_format == kTemporaryVertexAttribFormat113) {
-		static bool logged_113 = false;
-		if (!logged_113) {
-			LOGF("InputFormat: temporary: accepting invalid PS5 buffer format 113 as "
-			     "vk::Format::eR32G32B32A32Sfloat\n");
-			logged_113 = true;
-		}
-		format = vk::Format::eR32G32B32A32Sfloat;
-		size   = 4;
-		if (NarrowInputFormat(format, size, used_components)) {
-			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
-			     vk::to_string(format).c_str(), used_components);
-		}
-		return;
-	}
-	if (raw_format == kTemporaryPs5BufferFormat121) {
-		static bool logged_121 = false;
-		if (!logged_121) {
-			LOGF("InputFormat: accepting PS5 buffer format 121 as vk::Format::eR16G16Sfloat\n");
-			logged_121 = true;
-		}
-		format = vk::Format::eR16G16Sfloat;
-		size   = 2;
-		return;
-	}
-
-	format = VulkanFormat(fmt);
-	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
+	const auto info       = ShaderRecompiler::Format::GetVertexFormatInfo(res.Format());
+	format                = VulkanFormat(info.format);
+	size                  = info.component_count;
 	if (format == vk::Format::eUndefined || size == 0) {
 		EXIT("unknown vertex format: fmt = %u\n", raw_format);
 	}
@@ -287,18 +256,30 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                    ? vk::VertexInputRate::eInstance
 		                                    : vk::VertexInputRate::eVertex;
 	}
+	uint32_t active_attribute_count = 0;
 	for (uint32_t index = 0; index < vertex_input.attribute_count; index++) {
-		input_attr[index].binding  = vertex_input.attributes[index].binding;
-		input_attr[index].location = index;
-		input_attr[index].offset   = vertex_input.attributes[index].offset;
+		const auto& shader_info = vs_input_info.stage.program->info;
+		const auto input = std::find_if(shader_info.inputs.begin(), shader_info.inputs.end(),
+		    [index](const auto& value) {
+		        return value.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
+		               value.location == index;
+		    });
+		const auto compiled_components = shader_info.vertex_fetch_components[index];
+		const auto used_components = input != shader_info.inputs.end()
+		    ? input->component_count : compiled_components;
+		// Constant selectors do not emit a vertex input. In particular, a null
+		// descriptor can have format 0; it must not be passed to GetInputFormat.
+		if (used_components == 0) {
+			continue;
+		}
+		auto& attribute = input_attr[active_attribute_count++];
+		attribute.binding  = vertex_input.attributes[index].binding;
+		attribute.location = index;
+		attribute.offset   = vertex_input.attributes[index].offset;
 
 		uint32_t   attr_size     = 4;
 		const auto registers_num = vs_input_info.resources_dst[index].registers_num;
-		const auto compiled_components =
-		    vs_input_info.stage.program->info.vertex_fetch_components[index];
-		const auto used_components =
-		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
-		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
+		GetInputFormat(vs_input_info.resources[index], attribute.format, attr_size,
 		               static_cast<uint32_t>(used_components));
 
 		if (graphics_debug_dump_enabled()) {
@@ -308,9 +289,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 				LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
 				     "src_fmt=%u dst=v%u regs=%u"
 				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-				     log_id, index, input_attr[index].binding, input_attr[index].offset,
-				     input_desc[input_attr[index].binding].stride,
-				     static_cast<int>(input_attr[index].format),
+				     log_id, index, attribute.binding, attribute.offset,
+				     input_desc[attribute.binding].stride,
+				     static_cast<int>(attribute.format),
 				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
 				     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
 				     static_cast<uint32_t>(registers_num), static_cast<uint32_t>(used_components),
@@ -336,7 +317,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};
 	vertex_input_info.vertexBindingDescriptionCount   = vertex_input.binding_count;
 	vertex_input_info.pVertexBindingDescriptions      = input_desc;
-	vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
+	vertex_input_info.vertexAttributeDescriptionCount = active_attribute_count;
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};

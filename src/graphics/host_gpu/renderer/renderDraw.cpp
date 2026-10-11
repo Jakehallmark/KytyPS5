@@ -727,6 +727,11 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
+		if (range.base_address < 0x10000 || range.RequestedSize() > (uint64_t{1} << 32)) {
+			LOGF("VertexBindingDiagnostic: address=%016llx size=%016llx\n",
+			     static_cast<unsigned long long>(range.base_address),
+			     static_cast<unsigned long long>(range.RequestedSize()));
+		}
 		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());

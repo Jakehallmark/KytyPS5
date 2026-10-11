@@ -238,6 +238,17 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	}
 }
 
+// These compatibility formats are already accepted by the native vertex-input
+// renderer. Keep their channel decoding in sync with embedded fetch translation.
+// They are vertex-only aliases, not general typed-buffer formats.
+constexpr BufferFormatInfo GetVertexFormatInfo(Prospero::BufferFormat format) {
+	switch (static_cast<uint32_t>(format)) {
+		case 113u: return GetFormatInfo(Prospero::BufferFormat::k32_32_32_32Float);
+		case 121u: return GetFormatInfo(Prospero::BufferFormat::k16_16Float);
+		default: return GetFormatInfo(format);
+	}
+}
+
 constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, uint32_t component) {
 	if (component >= info.component_count) {
 		return 0;

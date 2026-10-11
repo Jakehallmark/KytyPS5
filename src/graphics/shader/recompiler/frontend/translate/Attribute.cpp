@@ -50,14 +50,17 @@ IR::ExportFlags Translator::AddExportInfo(const Decoder::Instruction& inst) {
 void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
                                         uint32_t component_count,
                                         const ShaderBufferResource& resource) {
-	const auto format = Format::GetFormatInfo(resource.Format());
+	const auto format = Format::GetVertexFormatInfo(resource.Format());
 	for (uint32_t component = 0; component < component_count; component++) {
 		auto source = Format::FormattedSource {Format::FormattedSourceKind::Memory, component};
 		if (inst.formatted && !inst.typed) {
 			source = Format::ResolveFormattedSource(
 			    format, GetDstSel(resource.DstSelXYZW(), component));
 			if (source.kind == Format::FormattedSourceKind::Invalid) {
-				EXIT("invalid formatted vertex input %u at pc 0x%08x", attribute, inst.pc);
+				EXIT("invalid formatted vertex input %u at pc 0x%08x: format=%u selector=%u "
+				     "descriptor=%08x,%08x,%08x,%08x", attribute, inst.pc,
+				     resource.RawFormat(), GetDstSel(resource.DstSelXYZW(), component),
+				     resource.fields[0], resource.fields[1], resource.fields[2], resource.fields[3]);
 			}
 		}
 		IR::Value value;

@@ -63,6 +63,10 @@ struct ShaderSource {
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
+[[nodiscard]] std::vector<int> GetEmbeddedVertexFetchAttributes(
+    const Decoder::Program& decoded, const ShaderVertexInputInfo& info,
+    uint32_t user_data_base, uint32_t user_data_count);
+
 [[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
 	                                           const CompileOptions& options);
 

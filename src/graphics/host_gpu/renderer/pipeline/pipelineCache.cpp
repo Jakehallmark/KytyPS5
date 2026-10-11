@@ -345,6 +345,13 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
+		// These addresses belong to this draw, even on a compiled shader cache hit.
+		const auto attach_fetch_reads = [&](ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				snapshot.specialization_reads.insert(snapshot.specialization_reads.end(),
+				                                     input_info.fetch_reads.begin(), input_info.fetch_reads.end());
+			}
+		};
 		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
@@ -356,6 +363,7 @@ struct PipelineCache::ProgramCache {
 				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
 			}
 			if (permutation != nullptr) {
+				attach_fetch_reads(entry->second.resources);
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -428,6 +436,7 @@ struct PipelineCache::ProgramCache {
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+				attach_fetch_reads(entry->second.resources);
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -437,6 +446,7 @@ struct PipelineCache::ProgramCache {
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
+		attach_fetch_reads(entry->second.resources);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 

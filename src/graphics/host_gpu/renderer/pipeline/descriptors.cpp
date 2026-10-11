@@ -791,6 +791,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
+			if (address < 0x10000 || size > (uint64_t{1} << 32)) {
+				LOGF("BufferBindingDiagnostic: resource=%zu descriptor=%08x,%08x,%08x,%08x\n",
+				     static_cast<size_t>(resource), descriptor.fields[0], descriptor.fields[1],
+				     descriptor.fields[2], descriptor.fields[3]);
+			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
