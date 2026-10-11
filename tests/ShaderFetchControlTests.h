@@ -4,6 +4,65 @@ void CheckShaderFetchControl() {
   using ShaderRecompiler::ApplyShaderFetchControl;
   using ShaderRecompiler::ShaderFetchControl;
   constexpr const char *name = "ConditionalEmbeddedVertexFetch";
+
+  // S_SUB_U32 writes the borrow-out bit to SCC. Exercise native branch
+  // specialization for both polarities, including unsigned boundary values.
+  struct SubtractionCase {
+    const char *label;
+    u32 lhs;
+    u32 rhs;
+    bool borrow;
+  };
+  constexpr std::array subtraction_cases{
+      SubtractionCase{"subtraction borrows", 0u, 1u, true},
+      SubtractionCase{"subtraction does not borrow", 5u, 3u, false},
+      SubtractionCase{"equal operands do not borrow", 5u, 5u, false},
+      SubtractionCase{"maximum minus zero does not borrow", 0xffffffffu, 0u, false},
+      SubtractionCase{"zero minus maximum borrows", 0u, 0xffffffffu, true},
+      SubtractionCase{"unsigned high-bit rhs borrows", 0x7fffffffu, 0x80000000u, true},
+      SubtractionCase{"unsigned high-bit lhs does not borrow", 0x80000000u, 0x7fffffffu, false},
+      SubtractionCase{"equal maximum operands do not borrow", 0xffffffffu, 0xffffffffu, false}};
+  for (const auto &test : subtraction_cases) {
+    for (const u32 branch_opcode : {0x04u, 0x05u}) {
+      std::vector<u32> subtraction_code;
+      AppendSMovLiteral(&subtraction_code, 0, test.lhs);
+      AppendSMovLiteral(&subtraction_code, 1, test.rhs);
+      const auto subtraction_pc = static_cast<u32>(subtraction_code.size() * sizeof(u32));
+      subtraction_code.push_back(EncodeSop2(0x01u, 2, 0, 1));
+      const auto subtraction_branch_pc = static_cast<u32>(subtraction_code.size() * sizeof(u32));
+      subtraction_code.push_back(EncodeSopp(branch_opcode, 1));
+      subtraction_code.push_back(EncodeSopp(0x00u));
+      AppendEnd(&subtraction_code);
+      ShaderRecompiler::Decoder::Program subtraction_decoded;
+      ShaderRecompiler::Decoder::DecodeProgram(subtraction_code, subtraction_decoded);
+      using Opcode = ShaderRecompiler::Decoder::Opcode;
+      Require(name, "native subtraction encoding",
+              std::ranges::any_of(subtraction_decoded.instructions, [&](const auto &inst) {
+                return inst.pc == subtraction_pc && inst.opcode == Opcode::S_SUB_U32;
+              }), "borrow regression must decode an actual S_SUB_U32 instruction");
+      const bool taken = branch_opcode == 0x05u ? test.borrow : !test.borrow;
+      const auto subtraction_control = AnalyzeShaderFetchControl(
+          subtraction_decoded, {}, 8, nullptr, nullptr, 32);
+      Require(name, test.label,
+              subtraction_control.decisions ==
+                  std::vector<std::pair<u32, bool>>{{subtraction_branch_pc, taken}},
+              branch_opcode == 0x05u
+                  ? "S_CBRANCH_SCC1 must take the branch only when subtraction borrows"
+                  : "S_CBRANCH_SCC0 must take the branch only when subtraction does not borrow");
+      const auto subtraction_specialized =
+          ApplyShaderFetchControl(subtraction_decoded, subtraction_control);
+      const auto branch = std::ranges::find_if(
+          subtraction_specialized.instructions, [&](const auto &inst) {
+            return inst.pc == subtraction_branch_pc;
+          });
+      Require(name, test.label,
+              branch != subtraction_specialized.instructions.end() &&
+                  branch->opcode == (taken ? Opcode::S_BRANCH : Opcode::S_NOP) &&
+                  (!taken || branch->branch_target == subtraction_branch_pc + 2 * sizeof(u32)),
+              "borrow specialization must preserve the taken target or fall through with a NOP");
+    }
+  }
+
   constexpr uint64_t flag_address = 0x1058;
   constexpr uint64_t fifth_descriptor = 0x2040;
   struct Memory {

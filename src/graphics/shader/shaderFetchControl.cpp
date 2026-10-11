@@ -292,7 +292,7 @@ private:
 				case Opcode::S_OR_B32: return uint32_t{(*a | *b) != 0u};
 				case Opcode::S_XOR_B32: return uint32_t{(*a ^ *b) != 0u};
 				case Opcode::S_ADD_U32: return uint32_t{uint64_t{*a} + *b > UINT32_MAX};
-				case Opcode::S_SUB_U32: return uint32_t{*a >= *b};
+				case Opcode::S_SUB_U32: return uint32_t{*a < *b};
 				default: return {};
 			}
 		}
